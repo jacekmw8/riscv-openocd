@@ -135,6 +135,9 @@ extern struct jtag_interface imx_gpio_interface;
 #if BUILD_XDS110 == 1
 extern struct jtag_interface xds110_interface;
 #endif
+#if BUILD_VDEBUG == 1
+extern struct jtag_interface vdebug_interface;
+#endif
 #endif /* standard drivers */
 
 /**
@@ -239,6 +242,9 @@ struct jtag_interface *jtag_interfaces[] = {
 #endif
 #if BUILD_XDS110 == 1
 		&xds110_interface,
+#endif
+#if BUILD_VDEBUG == 1
+        &vdebug_interface,
 #endif
 #endif /* standard drivers */
 		NULL,
