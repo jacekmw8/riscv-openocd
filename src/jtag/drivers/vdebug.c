@@ -21,7 +21,7 @@
 //# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //#----------------------------------------------------------------------------
 //# Revisions   :
-//# 40 04.05.20 : based on vd_client and vd_test 
+//# 41 04.06.20 : based on vd_client and vd_test 
 //#----------------------------------------------------------------------------
 
 /*!
@@ -69,9 +69,11 @@
 #include "jtag/interface.h"
 #include "jtag/commands.h"
 #include "transport/transport.h"
+#include "target/target.h"
+#include "target/target_type.h"
 #include "helper/log.h"
 
-#define VD_VERSION 40
+#define VD_VERSION 41
 #define VD_BUFFER_LEN 4024
 #define VD_CHEADER_LEN 24
 #define VD_SHEADER_LEN 16
@@ -179,6 +181,7 @@ typedef struct
 static FILE* debug_log = NULL;
 static uint16_t debug = 0;
 static uint8_t debug_out = 0;
+static uint8_t trans_batch = 1;
 static uint8_t trans_first = 0;
 static uint8_t trans_last = 0;
 
@@ -195,8 +198,6 @@ static uint32_t server_port;
 static uint32_t pollcycles = 10000;
 static uint32_t pollmin;
 static uint32_t pollmax;
-static uint64_t polltime;
-static uint32_t pollreqs = 0;
 static int hsocket;
 static char server_name[32];
 static char bfm_path[128];
@@ -204,7 +205,8 @@ static char mem_path[128];
 static vd_shm_st* pbuf = NULL;
 static const char* const vdebug_transports[] = { "jtag", NULL };
 
-//static int (*targ_poll)(struct target *target) = NULL;
+static struct target* ptarg = NULL;
+static int (*targ_poll)(struct target* ptar) = NULL;
 //static int (*targ_read_buffer)(struct target *target, uint32_t address, uint32_t size, uint8_t *buffer) = NULL;
 //static int (*targ_write_buffer)(struct target *target, uint32_t address, uint32_t size, const uint8_t *buffer) = NULL;
 
@@ -389,12 +391,13 @@ static int vdebug_open( SOCKET hsock, vd_shm_st* pm, const char* path, uint32_t 
     pm->wid = (uint16_t)VD_VERSION;
     pm->wbytes = pm->rbytes = pm->wwords = pm->rwords = 0;
     if( (rc = wait_server( hsock, pm )) != 0 ) // communication problem
-      debug_msg( rc, "vd_open: Error %x connecting to server", rc );
+      debug_msg( rc, "vd_open: Error 0x%x connecting to server", rc );
     else if( pm->rid < pm->wid )       // communication OK, but version wrong
     {
       debug_msg( VD_ERR_VERSION, "vd_open: server version %d too old for the client %d", pm->rid, pm->wid );
       pm->cmd = 0x02;                  // let server close the connection
       wait_server( hsock, pm );
+      rc = 0x207;
     }
     else
     {
@@ -414,7 +417,7 @@ static int vdebug_open( SOCKET hsock, vd_shm_st* pm, const char* path, uint32_t 
       addr_bits = pm->rd32[2];
     }
     if( rc )
-      debug_msg( rc, "vd_open: Error %x connecting to BFM %s", rc, path ); 
+      debug_msg( rc, "vd_open: Error 0x%x connecting to BFM %s", rc, path ); 
     else if( debug )
       debug_msg( VD_ERR_NONE, "vd_open: %s type %0x, period %dps, buffer %dx%dB signals r%04xw%04x",
       path, bfm_type, bfm_period, VD_BUFFER_LEN/buf_width, buf_width, sig_read, sig_write );
@@ -471,7 +474,7 @@ static int vdebug_sig_set( SOCKET hsock, vd_shm_st* pm, uint32_t write_mask, uin
     pm->wd32[0] = value;
     rc = wait_server( hsock, pm );
     if( rc ) 
-      debug_msg( rc, "vd_sig_set: Error %x setting signals %04x", rc, write_mask );
+      debug_msg( rc, "vd_sig_set: Error 0x%x setting signals %04x", rc, write_mask );
     else if( debug )
       debug_msg( VD_ERR_NONE, "vd_sig_set: setting signals %04x to %04x", write_mask, value );
   }
@@ -489,7 +492,7 @@ static int vdebug_jtag_clock( SOCKET hsock, vd_shm_st* pm, uint32_t value )
     pm->wd32[0] = value;
     rc = wait_server( hsock, pm );
     if( rc ) 
-      debug_msg( rc, "vd_jtag_clock: Error %x setting jtag_clock", rc );
+      debug_msg( rc, "vd_jtag_clock: Error 0x%x setting jtag_clock", rc );
     else if( debug )
       debug_msg( VD_ERR_NONE, "vd_jtag_clock: setting jtag clock divider to %d", value );
   }
@@ -506,8 +509,8 @@ static int vdebug_jtag_shift_tap( SOCKET hsock, vd_shm_st* pm, uint32_t num_pre,
   
   if( pm )
   {
-    pm->cmd = 0x18;
-    trans_last = f_last;
+    pm->cmd = 0x1a;
+    trans_last = f_last || (trans_batch == 0) || (trans_batch == 1 && tdo);
     if( trans_first )
       waddr = 0;             // reset buffer offset
     else
@@ -617,19 +620,34 @@ static int vdebug_jtag_shift_tap( SOCKET hsock, vd_shm_st* pm, uint32_t num_pre,
   return rc;
 }
 
+static int vdebug_poll( struct target* pt )
+{
+  int rc;
+  struct timeval ts, te;
+  uint32_t cmdtime;
+
+  assert( pt != NULL );
+  gettimeofday( &ts, NULL );
+  if( targ_poll )
+    rc = targ_poll( pt );
+  if( pt->state == TARGET_RUNNING )
+    pollcycles = pollmax;
+  else
+    pollcycles = pollmin;
+  vdebug_wait( hsocket, pbuf, pollcycles );
+  gettimeofday( &ts, NULL );
+  cmdtime = (uint32_t)((te.tv_sec - ts.tv_sec) * 1000000 + te.tv_usec - ts.tv_usec);
+  LOG_DEBUG("poll state:%u cycles:%u executed in %uus", pt->state, pollcycles, cmdtime );
+  return rc;
+}
+
 static int vdebug_init(void)
 {
   uint32_t type, sig_mask;
-  char* pchar;
   int rc = ERROR_OK;
 
   debug_open();
-  if( (pchar = getenv( "VD_POLL" )) == NULL )
-    rc = 1;                  // default 1 per second
-  else if( ((rc = strtoul( pchar, NULL, 10 )) > 5000) || (rc == 0) )
-    rc = 1;                  // invalid, possibly old value, revert to default
-  pollmin = 1000/(2*rc); pollmax = 1000/(rc); pollcycles = 10000/rc; polltime = pollmax;
-  pollreqs = 0;
+  pollmin = 1000; pollmax = 5000; pollcycles = pollmax;
   type = VD_BFM_JTAG;
   sig_mask = VD_SIG_RESET | VD_SIG_TRST | VD_SIG_TCKDIV;
 
@@ -652,6 +670,8 @@ static int vdebug_init(void)
 static int vdebug_quit(void)
 {
   int rc;
+  
+  targ_poll = NULL;// target is already destroyed at this point
   rc = vdebug_close( hsocket, pbuf, VD_BFM_JTAG );
   if( hsocket )
     socket_close( hsocket );
@@ -690,33 +710,28 @@ static int vdebug_reset(int trst, int srst)
   return rc;
 }
 
-static int vdebug_tms_seq(const uint8_t *bits, int nb_bits)
+static int vdebug_tms_seq(const uint8_t *tms, int num, uint8_t f_flush)
 {
-  LOG_INFO("TMS  len:%d tms:%x", nb_bits, *(const uint32_t*)bits);
-  return vdebug_jtag_shift_tap( hsocket, pbuf, nb_bits, *bits, 0, NULL, 0, 0, NULL, 0 );
+  LOG_INFO("tms  len:%d tms:%x", num, *(const uint32_t*)tms);
+  return vdebug_jtag_shift_tap( hsocket, pbuf, num, *tms, 0, NULL, 0, 0, NULL, f_flush );
 }
 
-static int vdebug_path_move(struct pathmove_command *cmd)
+static int vdebug_path_move(struct pathmove_command *cmd, uint8_t f_flush)
 {
-  uint8_t trans[DIV_ROUND_UP(cmd->num_states, 8)];
+  uint8_t tms[DIV_ROUND_UP(cmd->num_states, 8)];
   LOG_INFO("path num states %d", cmd->num_states );
 
-  memset(trans, 0, DIV_ROUND_UP(cmd->num_states, 8));
+  memset(tms, 0, DIV_ROUND_UP(cmd->num_states, 8));
 
   for (int i = 0; i < cmd->num_states; i++) {
     if (tap_state_transition(tap_get_state(), true) == cmd->path[i])
-      buf_set_u32(trans, i, 1, 1);
+      buf_set_u32(tms, i, 1, 1);
     tap_set_state(cmd->path[i]);
   }
-  return vdebug_tms_seq(trans, cmd->num_states);
+  return vdebug_tms_seq(tms, cmd->num_states, f_flush);
 }
 
-static int vdebug_tms(struct tms_command *cmd)
-{
-  return vdebug_tms_seq(cmd->bits, cmd->num_bits);
-}
-
-static int vdebug_tlr(tap_state_t state)
+static int vdebug_tlr(tap_state_t state, uint8_t f_flush)
 {
   int rc = ERROR_OK;
   uint8_t tms_pre;
@@ -729,7 +744,7 @@ static int vdebug_tlr(tap_state_t state)
   LOG_INFO("tlr  from %x to %x", cur, state );
   if (cur != state)
   {
-    rc = vdebug_jtag_shift_tap( hsocket, pbuf, num_pre, tms_pre, 0, NULL, 0, 0, NULL, 0 );
+    rc = vdebug_jtag_shift_tap( hsocket, pbuf, num_pre, tms_pre, 0, NULL, 0, 0, NULL, f_flush );
     tap_set_state(state);
   }
   return rc;
@@ -754,10 +769,7 @@ static int vdebug_scan(struct scan_command *cmd, uint8_t f_flush)
   num_post = tap_get_tms_path_len( state, cmd->end_state );
   nb_bits = jtag_build_buffer(cmd, &pb);
   if( jtag_scan_type( cmd ) & SCAN_IN )
-  {                          // read TDO when needed 
-    po = pb;
-    f_flush |= 1;            // force flush on read now...
-  }
+    po = pb;                 // read TDO when needed
   else
     po = NULL;
   LOG_DEBUG("scan len:%d ir/!dr:%d state cur:%x end:%x", nb_bits, cmd->ir_scan, cur, cmd->end_state );
@@ -773,7 +785,7 @@ static int vdebug_scan(struct scan_command *cmd, uint8_t f_flush)
   return rc;
 }
 
-static int vdebug_runtest(int cycles, tap_state_t state)
+static int vdebug_runtest(int cycles, tap_state_t state, uint8_t f_flush)
 {
   int rc;
   uint8_t tms_pre;
@@ -784,36 +796,16 @@ static int vdebug_runtest(int cycles, tap_state_t state)
   tms_pre = tap_get_tms_path( cur, state );
   num_pre = tap_get_tms_path_len( cur, state );
   LOG_DEBUG("idle len:%d state cur:%x end:%x", cycles, cur, state );
-  rc = vdebug_jtag_shift_tap( hsocket, pbuf, num_pre, tms_pre, cycles, NULL, 0, 0, NULL, 0 );
+  rc = vdebug_jtag_shift_tap( hsocket, pbuf, num_pre, tms_pre, cycles, NULL, 0, 0, NULL, f_flush );
   if( cur != state )
     tap_set_state( state );
   return rc;
 }
 
-static int vdebug_stableclocks(int cycles)
+static int vdebug_stableclocks(int num, uint8_t f_flush)
 {
-  uint8_t tms_bits[4];
-  int cycles_remain = cycles;
-  int nb_bits;
-  int retval;
-  const int CYCLES_ONE_BATCH = sizeof(tms_bits) * 8;
-
-  LOG_INFO("stab len:%d state cur:%x", cycles, tap_get_state() );
-  assert(cycles >= 0);
-
-  /* use TMS=1 in TAP RESET state, TMS=0 in all other stable states */
-  memset(&tms_bits, (tap_get_state() == TAP_RESET) ? 0xff : 0x00, sizeof(tms_bits));
-
-  /* send the TMS bits */
-  while (cycles_remain > 0) {
-    nb_bits = (cycles_remain < CYCLES_ONE_BATCH) ? cycles_remain : CYCLES_ONE_BATCH;
-    retval = vdebug_tms_seq(tms_bits, nb_bits);
-    if (retval != ERROR_OK)
-      return retval;
-    cycles_remain -= nb_bits;
-  }
-
-  return ERROR_OK;
+  LOG_INFO("stab len:%d state cur:%x", num, tap_get_state() );
+  return vdebug_jtag_shift_tap( hsocket, pbuf, num, 0, num, NULL, 0, 0, NULL, f_flush );
 }
 
 static int vdebug_sleep(int us)
@@ -868,19 +860,19 @@ static int vdebug_execute_queue(void)
         retval = vdebug_reset(cmd->cmd.reset->trst, cmd->cmd.reset->srst);
         break;
       case JTAG_RUNTEST:
-        retval = vdebug_runtest(cmd->cmd.runtest->num_cycles, cmd->cmd.runtest->end_state);
+        retval = vdebug_runtest(cmd->cmd.runtest->num_cycles, cmd->cmd.runtest->end_state, cmd->next == NULL);
         break;
       case JTAG_STABLECLOCKS:
-        retval = vdebug_stableclocks(cmd->cmd.stableclocks->num_cycles);
+        retval = vdebug_stableclocks(cmd->cmd.stableclocks->num_cycles, cmd->next == NULL);
         break;
       case JTAG_TLR_RESET:
-        retval = vdebug_tlr(cmd->cmd.statemove->end_state);
+        retval = vdebug_tlr(cmd->cmd.statemove->end_state, cmd->next == NULL);
         break;
       case JTAG_PATHMOVE:
-        retval = vdebug_path_move(cmd->cmd.pathmove);
+        retval = vdebug_path_move(cmd->cmd.pathmove, cmd->next == NULL);
         break;
       case JTAG_TMS:
-        retval = vdebug_tms(cmd->cmd.tms);
+        retval = vdebug_tms_seq(cmd->cmd.tms->bits, cmd->cmd.tms->num_bits, cmd->next == NULL);
         break;
       case JTAG_SLEEP:
         retval = vdebug_sleep(cmd->cmd.sleep->us);
@@ -891,6 +883,21 @@ static int vdebug_execute_queue(void)
     }
   }
   return retval;
+}
+
+static int vdebug_config_trace(bool enabled, enum tpiu_pin_protocol pin_protocol,
+                uint32_t port_size, unsigned int *trace_freq )
+{
+  *trace_freq = 0;
+  LOG_DEBUG("config_trace en:%d prot:%u size:%u freq:%u", enabled, pin_protocol, port_size, *trace_freq);
+  return ERROR_OK;
+}
+
+static int vdebug_poll_trace( uint8_t* buf, size_t* size )
+{
+  *size = 0;
+  LOG_DEBUG("poll_trace  ");
+  return vdebug_wait( hsocket, pbuf, pollcycles );
 }
 
 COMMAND_HANDLER(vdebug_set_server)
@@ -916,21 +923,6 @@ COMMAND_HANDLER(vdebug_set_server)
     rc = ERROR_OK;
   }
   LOG_DEBUG("vdebug server: %s port %u", server_name, server_port);
-  return rc;
-}
-
-COMMAND_HANDLER(vdebug_set_mem)
-{
-  int rc = ERROR_FAIL;
-  if (CMD_ARGC != 2)
-    LOG_ERROR("mem_path <path> <base_address>");
-  else
-  {
-    strncpy( mem_path, CMD_ARGV[0], sizeof(mem_path)-1 );
-    COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], mem_base);
-    rc = ERROR_OK;
-    LOG_DEBUG("vdebug mem_path: %s @ 0x%08x", mem_path, mem_base);
-  }
   return rc;
 }
 
@@ -962,6 +954,57 @@ COMMAND_HANDLER(vdebug_set_bfm)
   return rc;
 }
 
+COMMAND_HANDLER(vdebug_set_mem)
+{
+  int rc = ERROR_FAIL;
+  if (CMD_ARGC != 2)
+    LOG_ERROR("mem_path <path> <base_address>");
+  else
+  {
+    strncpy( mem_path, CMD_ARGV[0], sizeof(mem_path)-1 );
+    COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], mem_base);
+    rc = ERROR_OK;
+    LOG_DEBUG("vdebug mem_path: %s @ 0x%08x", mem_path, mem_base);
+  }
+  return rc;
+}
+
+COMMAND_HANDLER(vdebug_set_batching)
+{
+  int rc = ERROR_FAIL;
+
+  if (CMD_ARGC != 1)
+    LOG_ERROR("transaction_batching <level>");
+  else
+  {
+    trans_batch = atoi( CMD_ARGV[0] );
+    LOG_DEBUG("transaction_batching: level %u", trans_batch);
+    rc = ERROR_OK;
+  }
+  return rc;
+}
+
+COMMAND_HANDLER(vdebug_set_polling)
+{
+  int rc = ERROR_FAIL;
+
+  if (CMD_ARGC != 2)
+    LOG_ERROR("target_polling <min cycles>> <max cycles>");
+  else
+  {
+    pollmin = atoi( CMD_ARGV[0] );
+    pollmax = atoi( CMD_ARGV[1] );
+    if( ((ptarg = get_target_by_num(0)) != NULL) && ptarg->type != NULL )
+    {
+      targ_poll = ptarg->type->poll;
+      ptarg->type->poll = &vdebug_poll;
+      LOG_INFO("target_poll: registered min %u max %u cycles", pollmin, pollmax);
+    }
+    rc = ERROR_OK;
+  }
+  return rc;
+}
+
 static const struct command_registration vdebug_command_handlers[] = 
 {
   {
@@ -985,6 +1028,20 @@ static const struct command_registration vdebug_command_handlers[] =
     .help = "set the design memory for the code load",
     .usage = "mem_path <path> <base_address>",
   },
+  {
+    .name = "transaction_batching",
+    .handler = &vdebug_set_batching,
+    .mode = COMMAND_CONFIG,
+    .help = "set the transaction batching no|wr|rd [0|1|2]",
+    .usage = "transaction_batching <level>",
+  },
+  {
+    .name = "target_polling",
+    .handler = &vdebug_set_polling,
+    .mode = COMMAND_EXEC,
+    .help = "set the polling pause, executing hardware cycles between min and max",
+    .usage = "target_polling <min cycles> <max cycles>",
+  },
   COMMAND_REGISTRATION_DONE
 };
 
@@ -1000,4 +1057,6 @@ struct jtag_interface vdebug_interface =
   .commands = vdebug_command_handlers,
   .init = vdebug_init,
   .quit = vdebug_quit,
+  .config_trace = vdebug_config_trace,
+  .poll_trace = vdebug_poll_trace,
 };
